@@ -1,10 +1,24 @@
+use std::process::Command;
 use std::{collections::HashMap, fmt::format};
 use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use serde::{Deserialize,Serialize};
 
-use serde_json;
+
+//   todos for this project are 
+// 1 make sure that the requirements file is created and updated on every new package installation
+// 2 it get made from pip freeze command 
+
+
+
+
+
+#[derive(Debug)]
+struct PythonEnvManager{
+    base_path:PathBuf,
+    dependencies:HashMap<String,Package>,
+}
 
 #[derive(Debug,Deserialize,Serialize)]
 struct Package {
@@ -14,91 +28,163 @@ struct Package {
 }
 
 #[derive(Debug)]
-struct DependencyManager {
-    packages: HashMap<String,Package>,
+enum EnvError {
+    VenvCreationError(String),
+    PipInstallError(String),
+    PathError(String),
+   
 }
 
-impl DependencyManager {
-    fn new()-> Self {
-        DependencyManager {
-            packages: HashMap::new(),
+impl std::fmt::Display for EnvError {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        match self {
+            EnvError::VenvCreationError(e) => write!(f,"Error creating virtual environment: {}",e),
+            EnvError::PipInstallError(e) => write!(f,"Error installing package: {}",e),
+            EnvError::PathError(e) => write!(f,"Error with path: {}",e),
         }
     }
+}
 
-    fn add_package(&mut self, package:Package) {
-        self.packages.insert(package.name.clone(),package);
+impl Error for EnvError {}
+
+impl PythonEnvManager {
+    fn new<P:AsRef<Path>>(base_path:P)-> Result<Self,Box<dyn Error>>  {
+        let base_path = base_path.as_ref().to_path_buf();
+        fs::create_dir_all(&base_path)?;
+
+        Ok(PythonEnvManager{
+            base_path,
+            dependencies:HashMap::new(),
+        })
     }
 
-    fn get_package(&self , name:&str)-> Option<&Package>{
-        self.packages.get(name)
-    }
+    fn create_virtual_env(&self, project_name:&str)-> Result<PathBuf,EnvError>{
+        let venv_path = self.base_path.join(format!("{}/.venv",project_name));
+        let output = Command::new("python")
+            .args(&["-m","venv",venv_path.to_str().unwrap()])
+            .output()
+            .map_err(|err| EnvError::VenvCreationError(err.to_string()))?;
 
-    fn resolve_dependencies(&self, package_name:&str)->Result<Vec<String>,Box<dyn Error>>{
-        let mut resolved = Vec::new();
-        let mut to_visit = vec![package_name.to_string()];
-
-        while let Some(name) = to_visit.pop() {
-            if !resolved.contains(&name) {
-                let package = self.get_package(&name).ok_or_else(|| format!("package not found {}",name))?;
-                resolved.push(name);
-                to_visit.extend(package.dependencies.clone());
-            }
+        if !output.status.success() {
+            return Err(EnvError::VenvCreationError(
+                String::from_utf8_lossy(&output.stderr).to_string()
+            ));
         }
-        Ok(resolved)
+
+        Ok(venv_path)
     }
 
-    fn load_from_file<P: AsRef<Path>>(&mut self,path:P)-> Result<(),Box<dyn Error>>{
-        let contents = fs::read_to_string(path)?;
-        let packages:Vec<Package> = serde_json::from_str(&contents)?;
-        
-        for package in packages {
-            self.add_package(package);
+    fn get_pip_path(&self, venv_path:&Path)-> PathBuf{
+        #[cfg(windows)]
+        let pip_path = venv_path.join("Scripts").join("pip.exe");
+
+        #[cfg(not (windows))]
+        let pip_path = venv_path.join("bin").join("pip");
+
+        pip_path
+    }
+
+    fn install_package(&self, venv_path:&Path , package:&str , version:Option<&str>)->Result<(),EnvError>{
+       let pip_path = self.get_pip_path(venv_path);
+
+       let package_spec = match version {
+        Some(v)=> format!("{}=={}",package,v),
+        None => package.to_string(),
+       };
+
+       let output = Command::new(pip_path)
+            .args(&["install","--quiet",package_spec.as_str()])
+            .output()
+            .map_err(|err| EnvError::PipInstallError(err.to_string()))?;
+
+       
+       if !output.status.success(){
+        return Err(EnvError::PipInstallError(
+            String::from_utf8_lossy(&output.stderr).to_string()
+        ));
+       }
+
+        Ok(()) 
+    }
+
+
+    fn upgrade_pip(&self , venv_path:&Path) -> Result<(),EnvError> {
+        let pip_path = self.get_pip_path(venv_path);
+
+        let output = Command::new(&pip_path)
+            .args(&["install","--upgrade","pip"])
+            .output()
+            .map_err(|err| EnvError::PipInstallError(err.to_string()))?;
+
+        if !output.status.success() {
+            return Err(EnvError::PipInstallError(
+                String::from_utf8_lossy(&output.stderr).to_string()
+            ));
         }
 
         Ok(())
     }
 
-    fn save_to_file<P:AsRef<Path>>(&mut self , path:P)->Result<(),Box<dyn Error>>{
-        let packages:Vec<&Package> = self.packages.values().collect();
-        let contents= serde_json::to_string_pretty(&packages)?;
-        fs::write(path,contents)?;
+    fn create_requirements_file(&self,venv_path:&Path)-> Result<(),EnvError>{
+        let req_path = venv_path.parent()
+            .ok_or_else(|| EnvError::PathError(String::from("Error getting the parent path")))?
+            .to_path_buf()
+            .join("requirements.txt");
+
+ 
+
+        let output = Command::new(self.get_pip_path(venv_path))
+            .args(&["freeze"])
+            .stdout(fs::File::create(req_path).unwrap())
+            .output()
+            .map_err(|err| EnvError::PipInstallError(err.to_string()))?;
+
+        if !output.status.success() {
+            return Err(EnvError::PipInstallError(
+                String::from_utf8_lossy(&output.stderr).to_string()
+            ));
+        }
+
         Ok(())
+ 
     }
+
+
+    fn setup_project(&self, project_name:&str , packages:&[(&str,Option<&str>)])-> Result<PathBuf,EnvError>{
+        let venv_path = self.create_virtual_env(project_name)?;
+        println!("Created virtual environment at {:?}",venv_path);
+
+        for (package,version) in packages {
+            println!("Installing {}=={}",package,version.unwrap_or("latest"));
+            self.install_package(&venv_path,package,*version)?;
+        }
+
+        self.create_requirements_file(&venv_path)?;
+        print!("created requirements file");
+
+        Ok(venv_path)
+       
+    }
+
+   
 }
 
 
-fn main() {
-    let mut manager = DependencyManager::new();
-    manager.add_package(Package { 
-        name: "flask".to_string(), 
-        version: "2.1.0".to_string(), 
-        dependencies: vec!["werkzeug".to_string(), "jinja2".to_string()] 
-    });
-    manager.add_package(Package {
-        name: "werkzeug".to_string(),
-        version: "2.0.1".to_string(),
-        dependencies: vec![],
-    });
+fn main()-> Result<(),Box<dyn Error>> {
+    let mut manager = PythonEnvManager::new("./python_project")?;
 
-    manager.add_package(Package {
-        name: "jinja2".to_string(),
-        version: "3.0.1".to_string(),
-        dependencies: vec!["markupsafe".to_string()],
-    });
+    let packages = vec![
+        ("requests",None),
+        ("flask",None),
+       
+    ];
 
-    manager.add_package(Package {
-        name: "markupsafe".to_string(),
-        version: "2.0.1".to_string(),
-        dependencies: vec![],
-    });
+    match manager.setup_project("my_first_project", &packages) {
+        Ok(venv_path) => println!("Project setup successfully at {:?}",venv_path),
+        Err(e) => eprintln!("Error setting up project: {}",e),
+    }
 
-    let resolved =  manager.resolve_dependencies("flask")?;
-    println!("Resolved dependencies: {:?}", resolved);
-
-    manager.save_to_file("package.json");
-
-    let mut  new_manager = DependencyManager::new();
-    new_manager.load_from_file("package.json");
+    Ok(())
 
 }
 
